@@ -55,7 +55,7 @@ create_params_file(){
 		echo "$FILE already exists!"
 		exit 0;
 	fi
-	echo '{"C":"US","ST":"CA","L":"San Francisco","O":"Pivotal","OU":"Engineering","SAN":["*.sys","*.login.sys","*.uaa.sys","*.apps"],"YOUR_ENVIRONMENT_NAME":"pivotal","YOUR_DNS_SUFFIX":"pivotal.io","aws":{"access_key":"<YOUR ACCESS KEY>","secret_key":"<YOUR SECRET KEY>","region":"us-east","availability_zones":["us-east-1a","us-east-1b","us-east-1c"]},"PIVNET":{"api_token":"<YOUR TOKEN HERE>"}}' | jq . > params.json
+	echo '{"C":"US","ST":"CA","L":"San Francisco","O":"Pivotal","OU":"Engineering","SAN":["*.sys","*.login.sys","*.uaa.sys","*.apps"],"YOUR_ENVIRONMENT_NAME":"pivotal","YOUR_DNS_SUFFIX":"pivotal.io","aws":{"access_key":"<YOUR ACCESS KEY>","secret_key":"<YOUR SECRET KEY>","region":"us-east-1","availability_zones":["us-east-1a","us-east-1b","us-east-1c"]},"PIVNET":{"api_token":"<YOUR TOKEN HERE>"}}' | jq . > params.json
 }
 
 create_pcf(){
@@ -84,7 +84,7 @@ create_pcf(){
 
 	generate_certs
 	generate_tfvars
-	terraform_pcf
+	# terraform_pcf
 }
 
 generate_certs(){
@@ -199,14 +199,17 @@ parse_commandline()
 				_arg_filename="$2"
 				echo "FILENAME"
 				create_pcf
+				exit 0
 				;;
 			--filename=*)
 				_arg_filename="${_key##--filename=}"
+				exit 0
 				;;
 			--no-generate-params|--generate-params)
 				_arg_generate_params="on"
 				test "${1:0:5}" = "--no-" && _arg_generate_params="off"
 				create_params_file
+				exit 0
 				;;
 			-h|--help)
 				print_help
