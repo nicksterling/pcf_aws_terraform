@@ -1,0 +1,227 @@
+#!/bin/bash
+
+check_dependencies(){
+	if ! type "jq" > /dev/null; then
+	echo "You need to install jq to use this script!"
+	exit 0;
+	fi
+
+	if ! type "pivnet" > /dev/null; then
+	echo "You need to install pivnet to use this script!"
+	exit 0;
+	fi
+
+	# if ! type "terraform" > /dev/null; then
+	# echo "You need to install terraform to use this script!"
+	# exit 0;
+	# fi
+
+	#openssl
+}
+check_dependencies
+
+die()
+{
+	local _ret=$2
+	test -n "$_ret" || _ret=1
+	test "$_PRINT_HELP" = yes && print_help >&2
+	echo "$1" >&2
+	exit ${_ret}
+}
+
+
+begins_with_short_option()
+{
+	local first_option all_short_options='h'
+	first_option="${1:0:1}"
+	test "$all_short_options" = "${all_short_options/$first_option/}" && return 1 || return 0
+}
+
+# THE DEFAULTS INITIALIZATION - OPTIONALS
+_arg_filename=
+_arg_generate_params="off"
+
+
+print_help()
+{
+	printf '%s\n' "<The general help message of my script>"
+	printf 'Usage: %s [--filename <arg>] [--(no-)generate-params] [-h|--help]\n' "$0"
+	printf '\t%s\n' "-h, --help: Prints help"
+}
+
+create_params_file(){
+	FILE=params.json
+	if test -f "$FILE"; then
+		echo "$FILE already exists!"
+		exit 0;
+	fi
+	echo '{"C":"US","ST":"CA","L":"San Francisco","O":"Pivotal","OU":"Engineering","SAN":["*.sys","*.login.sys","*.uaa.sys","*.apps"],"YOUR_ENVIRONMENT_NAME":"pivotal","YOUR_DNS_SUFFIX":"pivotal.io","aws":{"access_key":"<YOUR ACCESS KEY>","secret_key":"<YOUR SECRET KEY>","region":"us-east","availability_zones":["us-east-1a","us-east-1b","us-east-1c"]},"PIVNET":{"api_token":"<YOUR TOKEN HERE>"}}' | jq . > params.json
+}
+
+create_pcf(){
+	echo "Creating PCF Environment"
+	echo "Parsing file $_arg_filename"
+
+	C=$(cat "$_arg_filename"| jq -r .C)
+	ST=$(cat "$_arg_filename"| jq -r .ST)
+	L=$(cat "$_arg_filename"| jq -r .L)
+	O=$(cat "$_arg_filename"| jq -r .O)
+	OU=$(cat "$_arg_filename"| jq -r .OU)
+	CN=$(cat "$_arg_filename" | jq -r '.YOUR_ENVIRONMENT_NAME + "." + .YOUR_DNS_SUFFIX')
+	YOUR_ENVIRONMENT_NAME=$(cat "$_arg_filename" | jq -r '.YOUR_ENVIRONMENT_NAME')
+	YOUR_DNS_SUFFIX=$(cat "$_arg_filename" | jq -r '.YOUR_DNS_SUFFIX')
+	aws_access_key=$(cat "$_arg_filename" | jq -r '.aws.access_key')
+	aws_secret_key=$(cat "$_arg_filename" | jq -r '.aws.secret_key')
+	aws_region=$(cat "$_arg_filename" | jq -r '.aws.region')
+	aws_availability_zones=$(cat "$_arg_filename" | jq -r ' ["\""+ .aws.availability_zones[] + "\""]| join(", ")')
+	SUBJ="/C=$C/ST=$ST/L=$L/O=$O/OU=$OU/CN=$CN"
+	SAN=$(cat "$_arg_filename" | jq -r '["DNS:" + .SAN[]  + "." + .YOUR_ENVIRONMENT_NAME + "." + .YOUR_DNS_SUFFIX]| join(",")')
+	pivnet_api_token=$(cat "$_arg_filename" | jq -r '.PIVNET.api_token')
+	# echo "$aws_region"
+	
+	# extract_ops_manager_ami
+	# exit 0;
+
+	generate_certs
+	generate_tfvars
+	terraform_pcf
+}
+
+generate_certs(){
+    mkdir generatedCerts
+	#Create Root Key
+	openssl genrsa -out generatedCerts/rootCA.key 4096
+
+	#Create and sign the root certificate
+	openssl req -x509 -new -nodes -key generatedCerts/rootCA.key -sha256 -days 1024 -out generatedCerts/rootCA.crt -subj "$SUBJ"
+
+	#Create Certificate Key
+	openssl genrsa -out generatedCerts/$CN.key 2048
+
+	#Generate the certificate signing request
+	openssl req -new -sha256 \
+		-key generatedCerts/$CN.key \
+		-subj "/C=US/ST=CA/O=MyOrg, Inc./CN=$CN" \
+		-reqexts SAN \
+		-config <(cat /etc/ssl/openssl.cnf \
+			<(printf "\n[SAN]\nsubjectAltName=DNS:$CN,DNS:www.$CN,$SAN")) \
+		-out generatedCerts/$CN.csr
+
+	#Verify the CSR's content
+	openssl req -in generatedCerts/$CN.csr -noout -text
+
+	#Generate the cert using CSR and key along with Root key
+	openssl x509 -req -in generatedCerts/$CN.csr -CA generatedCerts/rootCA.crt -CAkey generatedCerts/rootCA.key -CAcreateserial -out generatedCerts/$CN.crt -days 500 -sha256
+
+	#verify the cert's content
+	openssl x509 -in generatedCerts/$CN.crt -text -noout
+}
+
+extract_ops_manager_ami(){
+	pivnet login --api-token="$pivnet_api_token"
+	pivnet_ops_man_ami_id=$(pivnet product-files -p ops-manager -r 2.6.6 --format json | jq '.[] | select(.name | contains("Pivotal Cloud Foundry Ops Manager YAML for AWS")) | .id')
+	pivnet download-product-files -p ops-manager -r 2.6.6 -i $pivnet_ops_man_ami_id
+
+	for nam in ops-manager-aws-*.yml
+	do
+		newname=${nam%_done}
+		mv $nam ops_manager_ami.yml
+	done
+
+	sed -i -e "s/---/az ami/g" ops_manager_ami.yml
+	sed -i -e "s/://g" ops_manager_ami.yml
+	sed -i -e "s/ /,/g" ops_manager_ami.yml
+	
+	AWS_AMI=$(jq -R -s -f csv2json.jq ops_manager_ami.yml | jq -r --arg REGION "$aws_region" '.[] | select(.az == $REGION) | .ami')
+	# echo $AWS_AMI
+	rm ops_manager_ami.yml
+	
+}
+
+generate_tfvars(){
+
+	extract_ops_manager_ami
+	# exit 0
+	echo "TFVARS"
+	TFVARS=$(cat <<-EndOfMessage
+	env_name           = "$YOUR_ENVIRONMENT_NAME"
+	access_key         = "$aws_access_key"
+	secret_key         = "$aws_secret_key"
+	region             = "$aws_region"
+	availability_zones = [$aws_availability_zones]
+	ops_manager_ami    = "$AWS_AMI"
+	dns_suffix         = "$YOUR_DNS_SUFFIX"
+
+	ssl_cert = <<SSL_CERT
+	$(cat generatedCerts/$CN.crt)
+	SSL_CERT
+
+	ssl_private_key = <<SSL_KEY
+	$(cat generatedCerts/$CN.key)
+	SSL_KEY
+
+	EndOfMessage
+	)
+	echo "$TFVARS"
+	echo "$TFVARS" >> terraform.tfvars
+}
+
+terraform_pcf(){
+	# pivnet login --api-token="$pivnet_api_token"
+	pivnet_terraform_templates_id=$(pivnet product-files -p ops-manager -r 2.6.6 --format json | jq '.[] | select(.name | contains("Pivotal Cloud Foundry Ops Manager YAML for AWS")) | .id')
+	pivnet download-product-files -p elastic-runtime -r 2.6.3 -i $pivnet_terraform_templates_id
+
+	for nam in ops-manager-aws-*.yml
+	do
+		newname=${nam%_done}
+		mv $nam ops_manager_ami.yml
+	done
+
+	sed -i -e "s/---/az ami/g" ops_manager_ami.yml
+	sed -i -e "s/://g" ops_manager_ami.yml
+	sed -i -e "s/ /,/g" ops_manager_ami.yml
+	
+	AWS_AMI=$(jq -R -s -f csv2json.jq ops_manager_ami.yml | jq -r --arg REGION "$aws_region" '.[] | select(.az == $REGION) | .ami')
+	# echo $AWS_AMI
+	rm ops_manager_ami.yml
+	echo "Terraforming PCF"
+}
+
+
+parse_commandline()
+{
+	while test $# -gt 0
+	do
+		_key="$1"
+		case "$_key" in
+			--filename)
+				test $# -lt 2 && die "Missing value for the optional argument '$_key'." 1
+				_arg_filename="$2"
+				echo "FILENAME"
+				create_pcf
+				;;
+			--filename=*)
+				_arg_filename="${_key##--filename=}"
+				;;
+			--no-generate-params|--generate-params)
+				_arg_generate_params="on"
+				test "${1:0:5}" = "--no-" && _arg_generate_params="off"
+				create_params_file
+				;;
+			-h|--help)
+				print_help
+				exit 0
+				;;
+			-h*)
+				print_help
+				exit 0
+				;;
+			*)
+				_PRINT_HELP=yes die "FATAL ERROR: Got an unexpected argument '$1'" 1
+				;;
+		esac
+		shift
+	done
+}
+
+parse_commandline "$@"
